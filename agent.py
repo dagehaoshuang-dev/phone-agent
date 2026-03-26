@@ -14,12 +14,13 @@ from io import BytesIO
 from xml.etree import ElementTree
 
 import uiautomator2 as u2
-import anthropic
+from openai import OpenAI
 
 # ─── 配置 ───
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL_FAST = os.environ.get("PHONE_AGENT_MODEL_FAST", "claude-haiku-4-5-20251001")
-MODEL_SMART = os.environ.get("PHONE_AGENT_MODEL_SMART", "claude-sonnet-4-6")
+API_KEY = os.environ.get("PHONE_AGENT_API_KEY", "")
+BASE_URL = os.environ.get("PHONE_AGENT_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+MODEL_FAST = os.environ.get("PHONE_AGENT_MODEL_FAST", "qwen3.5-flash")
+MODEL_SMART = os.environ.get("PHONE_AGENT_MODEL_SMART", "qwen3.5-plus")
 MAX_STEPS = 40
 
 # ─── 工具定义 ───
@@ -79,7 +80,8 @@ APP_MAP = {
     "小红书": "com.xingin.xhs", "抖音": "com.ss.android.ugc.aweme",
     "微信": "com.tencent.mm", "高德地图": "com.autonavi.minimap",
     "百度地图": "com.baidu.BaiduMap", "淘宝": "com.taobao.taobao",
-    "支付宝": "com.eg.android.AlipayGphone", "chrome": "com.android.chrome",
+    "支付宝": "com.eg.android.AlipayGphone", "大众点评": "com.dianping.v1",
+    "chrome": "com.android.chrome",
     "设置": "com.android.settings",
 }
 
@@ -113,7 +115,7 @@ class PhoneAgent:
         self.width = info["displayWidth"]
         self.height = info["displayHeight"]
         print(f"📱 已连接: {self.device.serial} ({self.width}x{self.height})")
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
         self.elements = {}
         self._needs_screenshot = False  # 标记下一轮是否需要截图
 
@@ -202,21 +204,28 @@ class PhoneAgent:
             return f"✅tap({action['x']},{action['y']})"
 
         elif act == "type":
-            self.device.clear_text()
+            try:
+                self.device.clear_text()
+            except Exception:
+                pass  # 输入框可能未聚焦，忽略清除失败
             self.device.send_keys(action["text"])
             return f"✅type'{action['text']}'"
 
         elif act == "swipe":
             d = action.get("direction", "up")
             cx, cy = self.width // 2, self.height // 2
-            dist = self.height // 3
+            dy = self.height // 4
+            dx = self.width // 4
             swipes = {
-                "up": (cx, cy + dist, cx, cy - dist),
-                "down": (cx, cy - dist, cx, cy + dist),
-                "left": (cx + dist, cy, cx - dist, cy),
-                "right": (cx - dist, cy, cx + dist, cy),
+                "up": (cx, cy + dy, cx, cy - dy),
+                "down": (cx, cy - dy, cx, cy + dy),
+                "left": (cx + dx, cy, cx - dx, cy),
+                "right": (cx - dx, cy, cx + dx, cy),
             }
-            self.device.swipe(*swipes[d], duration=0.3)
+            try:
+                self.device.swipe(*swipes[d], duration=0.3)
+            except Exception as e:
+                return f"❌swipe_{d}:{e}"
             return f"✅swipe_{d}"
 
         elif act == "back":
@@ -228,11 +237,27 @@ class PhoneAgent:
             return "✅home"
 
         elif act == "launch":
-            app = action.get("text", "")
-            package = APP_MAP.get(app, app)
+            raw_app = action.get("text", "")
+            app = raw_app.strip().replace("\u200b", "").replace("\ufeff", "")
+            if not app:
+                return "❌launch:App名称为空"
+            # 精确匹配
+            package = APP_MAP.get(app)
+            # 模糊匹配
+            if not package:
+                for name, pkg in APP_MAP.items():
+                    if name in app or app in name:
+                        package = pkg
+                        break
+            # 包名直接用
+            if not package and "." in app:
+                package = app
+            if not package:
+                print(f"   ⚠️ 未匹配App: repr={repr(raw_app)}")
+                return f"❌launch:未知App'{app}'，可用:{','.join(APP_MAP.keys())}"
             self.device.app_start(package)
-            time.sleep(1.2)
-            self._needs_screenshot = True  # App 启动后下一轮自动截图
+            time.sleep(1.5)
+            self._needs_screenshot = True
             return f"✅launch:{app}"
 
         elif act == "wait":
@@ -261,75 +286,67 @@ class PhoneAgent:
 
         return " | ".join(results)
 
-    def choose_model(self, messages: list) -> str:
-        """根据上下文选择模型：有截图时用 smart，纯 UI 树用 fast"""
-        # 检查最近的消息是否包含截图
-        last_msg = messages[-1] if messages else {}
-        content = last_msg.get("content", "")
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    # tool_result 里可能嵌套 content
-                    inner = item.get("content", "")
-                    if isinstance(inner, list):
-                        for sub in inner:
-                            if isinstance(sub, dict) and sub.get("type") == "image":
-                                return MODEL_SMART
-        return MODEL_FAST
+    def choose_model(self, step: int, has_image=False) -> str:
+        """Qwen Flash 不够可靠，默认全部用 Plus"""
+        return MODEL_SMART
 
     def compress_messages(self, messages: list) -> list:
         if len(messages) <= 12:
             return messages
 
-        middle = messages[1:-8]
+        middle = messages[2:-8]  # skip system(0) + first user(1)
         summary_parts = []
         for msg in middle:
-            if msg["role"] == "assistant":
-                content = msg.get("content", [])
-                if isinstance(content, list):
-                    for block in content:
-                        if hasattr(block, "type") and block.type == "tool_use":
-                            if block.name == "actions":
-                                thought = block.input.get("thought", "")
-                                summary_parts.append(thought)
-                            elif block.name == "done":
-                                summary_parts.append("[完成]")
+            if msg["role"] == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc["function"]["name"]
+                    args = json.loads(tc["function"]["arguments"])
+                    if fn == "actions":
+                        summary_parts.append(args.get("thought", ""))
 
         summary = "已完成: " + " → ".join(summary_parts[-8:]) if summary_parts else ""
 
-        compressed = messages[:1]
+        compressed = messages[:2]  # system msg is separate, keep first user msg
         if summary:
             compressed.append({"role": "user", "content": summary})
             compressed.append({"role": "assistant", "content": "了解，继续。"})
         compressed.extend(messages[-8:])
         return compressed
 
+    def _openai_tools(self):
+        """将工具定义转为 OpenAI function calling 格式"""
+        return [
+            {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
+            for t in TOOLS
+        ]
+
     def run(self, task: str):
         print(f"\n🎯 任务: {task}\n")
         start_time = time.time()
-        messages = []
         total_actions = 0
         llm_calls = {"fast": 0, "smart": 0}
+        tools_openai = self._openai_tools()
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+        ]
 
         ui_tree = self.get_ui_tree()
-        messages.append({
-            "role": "user",
-            "content": f"任务: {task}\n\nUI:\n{ui_tree}"
-        })
+        messages.append({"role": "user", "content": f"任务: {task}\n\nUI:\n{ui_tree}"})
 
         for step in range(1, MAX_STEPS + 1):
             elapsed = time.time() - start_time
-            model = self.choose_model(messages)
+            has_image = self._needs_screenshot
+            model = self.choose_model(step, has_image)
             model_tag = "⚡" if model == MODEL_FAST else "🧠"
             print(f"\n── 步骤 {step} ({elapsed:.0f}s) {model_tag} ──")
 
             compressed = self.compress_messages(messages)
 
-            response = self.client.messages.create(
+            response = self.client.chat.completions.create(
                 model=model,
                 max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
+                tools=tools_openai,
                 messages=compressed,
             )
 
@@ -338,89 +355,112 @@ class PhoneAgent:
             else:
                 llm_calls["smart"] += 1
 
-            assistant_content = response.content
-            messages.append({"role": "assistant", "content": assistant_content})
+            choice = response.choices[0]
+            msg = choice.message
 
-            tool_use = None
-            for block in assistant_content:
-                if block.type == "text" and block.text.strip():
-                    print(f"   🤖 {block.text.strip()[:80]}")
-                elif block.type == "tool_use":
-                    tool_use = block
+            # 追加 assistant 消息
+            assistant_msg = {"role": "assistant", "content": msg.content or ""}
+            if msg.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ]
+            messages.append(assistant_msg)
 
-            if not tool_use:
-                messages.append({"role": "user", "content": "调用工具执行。"})
-                continue
+            if msg.content and msg.content.strip():
+                print(f"   🤖 {msg.content.strip()[:80]}")
+
+            if not msg.tool_calls:
+                if model == MODEL_FAST:
+                    # Flash 没返回工具调用，fallback 到 Plus 重试
+                    print("   ⚠️ Flash 无响应，切换 Plus 重试")
+                    response = self.client.chat.completions.create(
+                        model=MODEL_SMART, max_tokens=1024,
+                        tools=tools_openai, messages=compressed,
+                    )
+                    llm_calls["smart"] += 1
+                    choice = response.choices[0]
+                    msg = choice.message
+                    assistant_msg = {"role": "assistant", "content": msg.content or ""}
+                    if msg.tool_calls:
+                        assistant_msg["tool_calls"] = [
+                            {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                            for tc in msg.tool_calls
+                        ]
+                    messages[-1] = assistant_msg  # 替换上一条
+                    if msg.content and msg.content.strip():
+                        print(f"   🤖 {msg.content.strip()[:80]}")
+                    if not msg.tool_calls:
+                        messages.append({"role": "user", "content": "请调用工具执行下一步操作。"})
+                        continue
+                else:
+                    messages.append({"role": "user", "content": "请调用工具执行下一步操作。"})
+                    continue
+
+            tc = msg.tool_calls[0]
+            fn_name = tc.function.name
+            fn_args = json.loads(tc.function.arguments)
 
             # ── done ──
-            if tool_use.name == "done":
+            if fn_name == "done":
                 elapsed = time.time() - start_time
-                result = tool_use.input.get("result", "")
+                result = fn_args.get("result", "")
                 print(f"\n{'='*50}")
                 print(f"✅ 任务完成!\n")
                 print(result)
                 print(f"\n⏱️  总耗时: {elapsed:.1f}秒 ({int(elapsed//60)}分{int(elapsed%60)}秒)")
-                print(f"📊 LLM: {step}次 (⚡Haiku:{llm_calls['fast']} 🧠Sonnet:{llm_calls['smart']}) | 操作: {total_actions}次")
+                print(f"📊 LLM: {step}次 (⚡Flash:{llm_calls['fast']} 🧠Plus:{llm_calls['smart']}) | 操作: {total_actions}次")
                 print(f"{'='*50}")
-                messages.append({
-                    "role": "user",
-                    "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": "done"}]
-                })
                 return result
 
             # ── screenshot ──
-            if tool_use.name == "screenshot":
-                thought = tool_use.input.get("thought", "")
+            if fn_name == "screenshot":
+                thought = fn_args.get("thought", "")
                 print(f"   📸 {thought[:50]}")
                 img_b64 = self.take_screenshot_b64()
                 ui_tree = self.get_ui_tree()
                 self._needs_screenshot = False
                 messages.append({
-                    "role": "user",
-                    "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": [
+                    "role": "tool", "tool_call_id": tc.id,
+                    "content": [
                         {"type": "text", "text": f"UI:\n{ui_tree}"},
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}
-                    ]}]
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                    ]
                 })
                 continue
 
             # ── actions ──
-            if tool_use.name == "actions":
-                thought = tool_use.input.get("thought", "")
-                steps_list = tool_use.input.get("steps", [])
+            if fn_name == "actions":
+                thought = fn_args.get("thought", "")
+                steps_list = fn_args.get("steps", [])
                 n = len(steps_list)
                 total_actions += n
                 print(f"   💭 {thought}")
                 print(f"   🔧 {n}个操作:")
 
-                result = self.execute_actions(tool_use.input)
+                result = self.execute_actions(fn_args)
 
-                # App 启动后自动附带截图
                 if self._needs_screenshot:
                     img_b64 = self.take_screenshot_b64()
                     ui_tree = self.get_ui_tree()
                     self._needs_screenshot = False
                     print(f"   📸 自动截图(新App)")
                     messages.append({
-                        "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": [
+                        "role": "tool", "tool_call_id": tc.id,
+                        "content": [
                             {"type": "text", "text": f"{result}\n\nUI:\n{ui_tree}"},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}
-                        ]}]
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                        ]
                     })
                 else:
                     ui_tree = self.get_ui_tree()
                     messages.append({
-                        "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": tool_use.id,
-                                     "content": f"{result}\n\nUI:\n{ui_tree}"}]
+                        "role": "tool", "tool_call_id": tc.id,
+                        "content": f"{result}\n\nUI:\n{ui_tree}"
                     })
                 continue
 
-            messages.append({
-                "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": "未知工具"}]
-            })
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": "未知工具"})
 
         elapsed = time.time() - start_time
         print(f"\n⚠️ 达到最大步数，耗时: {elapsed:.1f}秒")
