@@ -153,12 +153,25 @@ Contextor(LLM) → Cortex(LLM) → Executor(LLM) → Orchestrator(LLM) → [Plan
 
 **对比：单 Agent 方案每步仅 1 次 LLM 调用，耗时 1-2 秒。**
 
-### 4.2 模型兼容性差
+### 4.2 模型兼容性差（实测验证）
 
-- **Gemini 不兼容**：`with_structured_output()` 在 Gemini 2.5 Flash/Pro 上 Cortex 返回空内容，完全无法工作
-- **DeepSeek 不兼容**：不支持 `response_format` 参数
-- **OpenAI 低额度受限**：截图导致 token 量大，低 Tier 账户频繁触发 rate limit
-- **实际可用组合有限**：测试中只有 OpenAI GPT-4o+ 和 GPT-5.4 系列能稳定工作
+mobile-use 使用 LangChain 的 `with_structured_output()` 强制 LLM 返回结构化 JSON，但该方法依赖 OpenAI 的 `response_format` 参数，其他模型的实现各有差异，导致严重的兼容性问题：
+
+| 模型 | 结果 | 失败原因 |
+|------|------|----------|
+| **OpenAI GPT-5.4** | ✅ 正常工作 | 原生支持 `response_format` |
+| **OpenAI GPT-4o** | ⚠️ 受限 | 能工作但低 Tier 账户频繁触发 rate limit（截图导致 token 量大） |
+| **Gemini 2.5 Flash/Pro** | ❌ 完全不可用 | Cortex Agent 每次返回空内容，无法做出任何决策，导致无限重规划循环 |
+| **DeepSeek** | ❌ 完全不可用 | 不支持 `response_format` 参数，主模型和 fallback 均失败 |
+| **Qwen 3.5 Plus** | ❌ 部分不可用 | Planner/Cortex 能工作（prompt 恰好含"json"），但 Hopper/Orchestrator 失败。Qwen 要求 prompt 中必须包含"json"一词才能使用 `response_format: json_object`，而 mobile-use 部分 Agent 的 prompt 不满足此条件 |
+
+**根因分析**：mobile-use 通过 LangChain 的 `with_structured_output()` 抽象层调用 LLM，该方法在底层使用 `response_format` 参数。但不同模型对此参数的支持差异很大：
+- OpenAI：原生支持，无额外要求
+- Gemini：支持但返回行为不一致（经常返回空）
+- Qwen：要求 prompt 中包含"json"一词，否则报 400 错误
+- DeepSeek：完全不支持该参数
+
+**对比**：phone-agent 使用 OpenAI 标准的 `function calling`（tool_use）接口，这是各模型兼容性最好的结构化输出方式。实测 Qwen 3.5 Plus、Claude Sonnet/Haiku、OpenAI GPT-5.4 均可正常工作，无任何兼容性问题。
 
 ### 4.3 过度设计
 
