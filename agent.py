@@ -1,5 +1,6 @@
 """
-Phone Agent - 单 Agent 手机自动化控制
+Phone Agent v2 - 高性能单 Agent 手机自动化控制
+优化：多动作合批、精简 UI 树、智能等待、上下文压缩
 用法: python agent.py "打开小红书搜索美食推荐，告诉我前3个帖子标题"
 """
 
@@ -7,12 +8,10 @@ import sys
 import time
 import json
 import base64
-import subprocess
 import re
+import os
 from io import BytesIO
 from xml.etree import ElementTree
-
-import os
 
 import uiautomator2 as u2
 import anthropic
@@ -22,178 +21,111 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 MODEL = os.environ.get("PHONE_AGENT_MODEL", "claude-sonnet-4-6")
 MAX_STEPS = 40
 
-# ─── 工具定义 ───
+# ─── 工具定义（精简 schema，减少 token） ───
 TOOLS = [
     {
-        "name": "tap",
-        "description": "点击屏幕上的某个元素。用 element_id 指定 UI 树中的元素编号。",
+        "name": "actions",
+        "description": "执行一个或多个连续手机操作。支持在一次调用中批量执行多个动作，减少往返次数。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "element_id": {"type": "integer", "description": "UI 树中的元素编号"},
-                "thought": {"type": "string", "description": "为什么点击这个元素"}
+                "thought": {"type": "string", "description": "简要说明这一轮的思路"},
+                "steps": {
+                    "type": "array",
+                    "description": "要执行的操作列表，按顺序执行",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["tap", "tap_xy", "type", "swipe", "back", "home", "launch", "wait"]
+                            },
+                            "element_id": {"type": "integer", "description": "tap 时的元素编号"},
+                            "x": {"type": "integer"}, "y": {"type": "integer"},
+                            "text": {"type": "string", "description": "type 时的文本，或 launch 时的 App 名称"},
+                            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                            "seconds": {"type": "number"}
+                        },
+                        "required": ["action"]
+                    }
+                }
             },
-            "required": ["element_id", "thought"]
-        }
-    },
-    {
-        "name": "tap_xy",
-        "description": "点击屏幕上的指定坐标。仅在 element_id 不可用时使用。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "integer"},
-                "y": {"type": "integer"},
-                "thought": {"type": "string"}
-            },
-            "required": ["x", "y", "thought"]
-        }
-    },
-    {
-        "name": "type_text",
-        "description": "在当前聚焦的输入框中输入文本。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "要输入的文本"},
-                "thought": {"type": "string"}
-            },
-            "required": ["text", "thought"]
-        }
-    },
-    {
-        "name": "swipe",
-        "description": "在屏幕上滑动。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "滑动方向"},
-                "thought": {"type": "string"}
-            },
-            "required": ["direction", "thought"]
-        }
-    },
-    {
-        "name": "press_back",
-        "description": "按返回键。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "thought": {"type": "string"}
-            },
-            "required": ["thought"]
-        }
-    },
-    {
-        "name": "press_home",
-        "description": "按 Home 键回到主屏幕。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "thought": {"type": "string"}
-            },
-            "required": ["thought"]
-        }
-    },
-    {
-        "name": "launch_app",
-        "description": "启动一个 App。提供 App 名称或包名。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "app": {"type": "string", "description": "App 名称（如'小红书'）或包名（如'com.xingin.xhs'）"},
-                "thought": {"type": "string"}
-            },
-            "required": ["app", "thought"]
+            "required": ["thought", "steps"]
         }
     },
     {
         "name": "screenshot",
-        "description": "获取当前屏幕截图。当 UI 树信息不足以判断屏幕内容时使用。",
+        "description": "获取屏幕截图。仅在 UI 树不足以判断时使用。",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "thought": {"type": "string"}
-            },
+            "properties": {"thought": {"type": "string"}},
             "required": ["thought"]
         }
     },
     {
-        "name": "wait",
-        "description": "等待一段时间让页面加载。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "seconds": {"type": "number", "description": "等待秒数（1-5）"},
-                "thought": {"type": "string"}
-            },
-            "required": ["seconds", "thought"]
-        }
-    },
-    {
         "name": "done",
-        "description": "任务完成，返回最终结果给用户。",
+        "description": "任务完成，返回结果。",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "result": {"type": "string", "description": "最终结果，直接展示给用户"}
-            },
+            "properties": {"result": {"type": "string", "description": "最终结果"}},
             "required": ["result"]
         }
     }
 ]
 
-# ─── App 名称 → 包名映射 ───
+# ─── App 映射 ───
 APP_MAP = {
-    "小红书": "com.xingin.xhs",
-    "抖音": "com.ss.android.ugc.aweme",
-    "微信": "com.tencent.mm",
-    "高德地图": "com.autonavi.minimap",
-    "百度地图": "com.baidu.BaiduMap",
-    "淘宝": "com.taobao.taobao",
-    "支付宝": "com.eg.android.AlipayGphone",
-    "chrome": "com.android.chrome",
+    "小红书": "com.xingin.xhs", "抖音": "com.ss.android.ugc.aweme",
+    "微信": "com.tencent.mm", "高德地图": "com.autonavi.minimap",
+    "百度地图": "com.baidu.BaiduMap", "淘宝": "com.taobao.taobao",
+    "支付宝": "com.eg.android.AlipayGphone", "chrome": "com.android.chrome",
     "设置": "com.android.settings",
 }
 
-SYSTEM_PROMPT = """你是一个手机操控助手。你可以通过工具控制一台 Android 手机来完成用户的任务。
+SYSTEM_PROMPT = """你是一个高效的手机操控助手，通过工具控制 Android 手机完成任务。
 
-## 工作方式
-每一轮你会收到手机屏幕的 UI 元素树（带编号），你需要：
-1. 分析当前屏幕状态
-2. 决定下一步操作
-3. 调用一个工具执行
+## 核心规则
+1. 使用 actions 工具时可以把多个连续操作放在一个 steps 数组里批量执行（如：点击搜索框 → 输入文字 → 点击搜索按钮）
+2. 优先用 element_id 点击，避免用坐标
+3. 只在 UI 树信息不足时才用 screenshot
+4. thought 要简短（<30字）
+5. 任务完成立即调用 done
+6. 不要犹豫和反复确认，果断执行操作
+7. 记住已获取的信息，不要重复去查看
 
-## 重要规则
-- 每次只调用一个工具
-- 用 element_id 点击元素（优先），而不是坐标
-- 输入文字前确保输入框已聚焦（先点击输入框）
-- 如果 UI 树信息不够，调用 screenshot 获取截图辅助判断
-- 操作后会自动获取新的 UI 树，不需要你手动获取
-- 任务完成后必须调用 done 工具返回结果
-- 尽量高效，减少不必要的操作步骤
-- 如果页面需要加载，使用 wait 等待 1-2 秒
+## UI 树格式
+[编号] 类型 "文本" (属性)
+属性: C=可点击 F=已聚焦 id:资源ID
+
+## 批量操作示例
+可以一次执行多步：tap搜索框 → type输入内容 → tap搜索按钮
+不确定结果的操作（如页面跳转后）单独执行，等下一轮看到新 UI 树再决策。
+
+## 常见 App 操作技巧
+- **高德地图搜索**：直接在搜索框输入地点名称后点搜索按钮，比点历史记录更可靠。搜索结果列表中第一条通常是主地点，下面的是子地点（停车场、出入口等），优先点击第一条。
+- **高德地图详情页按钮区分**：详情页底部通常有"路线"和"打车"两个按钮。"路线"是查看自驾/公交/步行时间的导航规划；"打车"是叫车服务和费用估算。根据用户需求选择正确的按钮。
+- **高德地图路线规划**：进入后页面顶部有"公共交通"/"驾车"/"步行"标签页，点击切换查看。如果弹出"选择目的地门"弹窗，直接点"跳过"。
+- **小红书搜索**：搜索后注意区分广告帖和普通帖子，广告帖通常有"广告"标签。
+- **小红书帖子**：正文如果被截断有"展开"按钮，图片内容需要用 screenshot 工具查看。
 """
 
 
 class PhoneAgent:
     def __init__(self, device_serial=None):
-        # 连接设备
         if device_serial:
             self.device = u2.connect(device_serial)
         else:
             self.device = u2.connect()
         info = self.device.info
-        print(f"📱 已连接: {self.device.serial}")
-        print(f"   分辨率: {info['displayWidth']}x{info['displayHeight']}")
-
         self.width = info["displayWidth"]
         self.height = info["displayHeight"]
+        print(f"📱 已连接: {self.device.serial} ({self.width}x{self.height})")
         self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        self.elements = {}  # element_id → element_info
+        self.elements = {}
+        self._last_ui_hash = None
 
     def get_ui_tree(self) -> str:
-        """获取 UI 树并格式化为带编号的文本"""
+        """获取精简 UI 树"""
         xml = self.device.dump_hierarchy()
         root = ElementTree.fromstring(xml)
         self.elements = {}
@@ -209,75 +141,75 @@ class PhoneAgent:
             bounds_str = node.attrib.get("bounds", "")
             resource_id = node.attrib.get("resource-id", "")
 
-            # 只保留有意义的元素
             if not text and not desc and not clickable:
                 continue
 
-            # 解析坐标
-            bounds_match = re.findall(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
-            if not bounds_match:
+            m = re.findall(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
+            if not m:
                 continue
-            x1, y1, x2, y2 = map(int, bounds_match[0])
+            x1, y1, x2, y2 = map(int, m[0])
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-            # 跳过屏幕外的元素
             if cx < 0 or cy < 0 or cx > self.width or cy > self.height:
+                continue
+            # 跳过太小的不可见元素
+            if (x2 - x1) < 5 or (y2 - y1) < 5:
                 continue
 
             idx += 1
-            self.elements[idx] = {"x": cx, "y": cy, "bounds": (x1, y1, x2, y2)}
+            self.elements[idx] = {"x": cx, "y": cy}
 
-            # 格式化输出
+            # 极简格式: [1] Button "搜索" C id:search
             label = text or desc or ""
-            attrs = []
-            if clickable:
-                attrs.append("可点击")
-            if focused:
-                attrs.append("已聚焦")
-            if resource_id:
-                short_id = resource_id.split("/")[-1]
-                attrs.append(f"id:{short_id}")
+            flags = ""
+            if clickable: flags += "C"
+            if focused: flags += "F"
+            rid = resource_id.split("/")[-1] if resource_id else ""
 
-            attr_str = f" ({', '.join(attrs)})" if attrs else ""
-            label_str = f' "{label}"' if label else ""
-            lines.append(f"[{idx}] {cls}{label_str}{attr_str}")
+            parts = [f"[{idx}]", cls]
+            if label:
+                # 截断长文本
+                parts.append(f'"{label[:40]}"' if len(label) > 40 else f'"{label}"')
+            if flags:
+                parts.append(flags)
+            if rid:
+                parts.append(f"id:{rid}")
+            lines.append(" ".join(parts))
 
-        return "\n".join(lines) if lines else "(屏幕上没有可识别的 UI 元素)"
+        tree_str = "\n".join(lines) if lines else "(空)"
+        self._last_ui_hash = hash(tree_str)
+        return tree_str
 
     def take_screenshot_b64(self) -> str:
-        """截图并返回 base64"""
         img = self.device.screenshot()
-        # 缩小以节省 tokens
-        img = img.resize((img.width // 2, img.height // 2))
+        img = img.resize((img.width // 3, img.height // 3))  # 缩小到1/3
         buf = BytesIO()
-        img.save(buf, format="JPEG", quality=60)
+        img.save(buf, format="JPEG", quality=50)
         return base64.standard_b64encode(buf.getvalue()).decode()
 
-    def execute_tool(self, name: str, args: dict) -> str:
-        """执行工具并返回结果"""
-        thought = args.get("thought", "")
-        if thought:
-            print(f"   💭 {thought}")
+    def execute_action(self, action: dict) -> str:
+        """执行单个 action"""
+        act = action["action"]
 
-        if name == "tap":
-            eid = args["element_id"]
+        if act == "tap":
+            eid = action.get("element_id")
             if eid not in self.elements:
-                return f"❌ 元素 [{eid}] 不存在，请检查编号"
+                return f"❌ [{eid}] 不存在"
             el = self.elements[eid]
             self.device.click(el["x"], el["y"])
-            return f"✅ 已点击元素 [{eid}] 坐标({el['x']}, {el['y']})"
+            return f"✅ tap [{eid}]"
 
-        elif name == "tap_xy":
-            self.device.click(args["x"], args["y"])
-            return f"✅ 已点击坐标({args['x']}, {args['y']})"
+        elif act == "tap_xy":
+            self.device.click(action["x"], action["y"])
+            return f"✅ tap ({action['x']},{action['y']})"
 
-        elif name == "type_text":
+        elif act == "type":
             self.device.clear_text()
-            self.device.send_keys(args["text"])
-            return f"✅ 已输入: {args['text']}"
+            self.device.send_keys(action["text"])
+            return f"✅ type '{action['text']}'"
 
-        elif name == "swipe":
-            d = args["direction"]
+        elif act == "swipe":
+            d = action.get("direction", "up")
             cx, cy = self.width // 2, self.height // 2
             dist = self.height // 3
             swipes = {
@@ -287,143 +219,188 @@ class PhoneAgent:
                 "right": (cx - dist, cy, cx + dist, cy),
             }
             self.device.swipe(*swipes[d], duration=0.3)
-            return f"✅ 已向{d}滑动"
+            return f"✅ swipe {d}"
 
-        elif name == "press_back":
+        elif act == "back":
             self.device.press("back")
-            return "✅ 已按返回键"
+            return "✅ back"
 
-        elif name == "press_home":
+        elif act == "home":
             self.device.press("home")
-            return "✅ 已回到主屏幕"
+            return "✅ home"
 
-        elif name == "launch_app":
-            app = args["app"]
+        elif act == "launch":
+            app = action.get("text", "")
             package = APP_MAP.get(app, app)
             self.device.app_start(package)
-            time.sleep(2)
-            return f"✅ 已启动 {app} ({package})"
+            time.sleep(1.5)
+            return f"✅ launch {app}"
 
-        elif name == "screenshot":
-            return "__SCREENSHOT__"
-
-        elif name == "wait":
-            sec = min(args.get("seconds", 2), 5)
+        elif act == "wait":
+            sec = min(action.get("seconds", 1), 3)
             time.sleep(sec)
-            return f"✅ 已等待 {sec} 秒"
+            return f"✅ wait {sec}s"
 
-        elif name == "done":
-            return "__DONE__"
+        return f"❌ unknown: {act}"
 
-        return f"❌ 未知工具: {name}"
+    def execute_actions(self, args: dict) -> str:
+        """批量执行多个 action"""
+        steps = args.get("steps", [])
+        results = []
+        needs_page_load = False
+
+        for i, step in enumerate(steps):
+            result = self.execute_action(step)
+            results.append(result)
+            print(f"   {result}")
+
+            act = step["action"]
+            # 页面跳转类操作之间加短暂等待
+            if act in ("tap", "tap_xy", "launch") and i < len(steps) - 1:
+                time.sleep(0.3)
+            # 标记是否需要等页面加载
+            if act in ("launch", "tap", "tap_xy"):
+                needs_page_load = True
+
+        # 最后一个操作后等待页面稳定
+        if needs_page_load:
+            time.sleep(0.5)
+
+        return " | ".join(results)
+
+    def compress_messages(self, messages: list) -> list:
+        """压缩历史消息：用摘要替换中间部分，保留完整上下文"""
+        if len(messages) <= 12:
+            return messages
+
+        # 提取中间消息的关键操作摘要
+        middle = messages[1:-8]
+        summary_parts = []
+        for msg in middle:
+            if msg["role"] == "assistant":
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if hasattr(block, "type"):
+                            if block.type == "text" and block.text.strip():
+                                summary_parts.append(block.text.strip()[:60])
+                            elif block.type == "tool_use":
+                                summary_parts.append(f"[调用:{block.name}]")
+
+        summary = "之前已完成的操作摘要：" + " → ".join(summary_parts[-10:]) if summary_parts else ""
+
+        # 第1条(任务) + 摘要 + 最后8条(近期上下文)
+        compressed = messages[:1]
+        if summary:
+            compressed.append({"role": "user", "content": summary})
+            compressed.append({"role": "assistant", "content": "好的，我了解之前的操作进度，继续执行任务。"})
+        compressed.extend(messages[-8:])
+        return compressed
 
     def run(self, task: str):
-        """主循环"""
         print(f"\n🎯 任务: {task}\n")
         start_time = time.time()
-
         messages = []
+        total_actions = 0
 
-        # 获取初始 UI 树
         ui_tree = self.get_ui_tree()
         messages.append({
             "role": "user",
-            "content": f"任务: {task}\n\n当前屏幕 UI 元素:\n{ui_tree}"
+            "content": f"任务: {task}\n\nUI:\n{ui_tree}"
         })
 
         for step in range(1, MAX_STEPS + 1):
-            print(f"\n── 步骤 {step}/{MAX_STEPS} ──")
+            elapsed = time.time() - start_time
+            print(f"\n── 步骤 {step} ({elapsed:.0f}s) ──")
 
-            # 调用 LLM
+            # 压缩历史消息
+            compressed = self.compress_messages(messages)
+
             response = self.client.messages.create(
                 model=MODEL,
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
                 tools=TOOLS,
-                messages=messages,
+                messages=compressed,
             )
 
-            # 处理响应
             assistant_content = response.content
             messages.append({"role": "assistant", "content": assistant_content})
 
-            # 找到 tool_use block
             tool_use = None
             for block in assistant_content:
                 if block.type == "text" and block.text.strip():
-                    print(f"   🤖 {block.text.strip()[:100]}")
+                    print(f"   🤖 {block.text.strip()[:80]}")
                 elif block.type == "tool_use":
                     tool_use = block
 
             if not tool_use:
-                print("   ⚠️  LLM 没有调用工具，重试...")
-                messages.append({
-                    "role": "user",
-                    "content": "请调用一个工具来执行下一步操作。"
-                })
+                messages.append({"role": "user", "content": "请调用工具执行下一步。"})
                 continue
 
-            print(f"   🔧 {tool_use.name}({json.dumps(tool_use.input, ensure_ascii=False)[:120]})")
-
-            # 检查是否完成
+            # ── done ──
             if tool_use.name == "done":
                 elapsed = time.time() - start_time
                 result = tool_use.input.get("result", "")
                 print(f"\n{'='*50}")
-                print(f"✅ 任务完成!")
-                print(f"\n{result}")
-                print(f"\n⏱️  总耗时: {elapsed:.1f} 秒 ({int(elapsed//60)}分{int(elapsed%60)}秒)")
-                print(f"📊 总步骤: {step}")
+                print(f"✅ 任务完成!\n")
+                print(result)
+                print(f"\n⏱️  总耗时: {elapsed:.1f}秒 ({int(elapsed//60)}分{int(elapsed%60)}秒)")
+                print(f"📊 LLM 调用: {step}次 | 设备操作: {total_actions}次")
                 print(f"{'='*50}")
-
-                # 构造 tool_result 以保持消息格式正确
                 messages.append({
                     "role": "user",
-                    "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": "任务已完成"}]
+                    "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": "done"}]
                 })
                 return result
 
-            # 执行工具
-            result = self.execute_tool(tool_use.name, tool_use.input)
-
-            # 截图请求
-            if result == "__SCREENSHOT__":
+            # ── screenshot ──
+            if tool_use.name == "screenshot":
+                thought = tool_use.input.get("thought", "")
+                print(f"   📸 {thought[:50]}")
                 img_b64 = self.take_screenshot_b64()
-                print("   📸 已截图")
-                time.sleep(0.5)
                 ui_tree = self.get_ui_tree()
                 messages.append({
                     "role": "user",
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": tool_use.id, "content": [
-                            {"type": "text", "text": f"截图已获取。当前 UI 元素:\n{ui_tree}"},
-                            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}
-                        ]}
-                    ]
+                    "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": [
+                        {"type": "text", "text": f"UI:\n{ui_tree}"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}}
+                    ]}]
                 })
                 continue
 
-            print(f"   {result}")
+            # ── actions ──
+            if tool_use.name == "actions":
+                thought = tool_use.input.get("thought", "")
+                steps_list = tool_use.input.get("steps", [])
+                n = len(steps_list)
+                total_actions += n
+                print(f"   💭 {thought}")
+                print(f"   🔧 执行 {n} 个操作:")
 
-            # 获取新的 UI 树
-            time.sleep(0.8)
-            ui_tree = self.get_ui_tree()
+                result = self.execute_actions(tool_use.input)
 
+                ui_tree = self.get_ui_tree()
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tool_use.id,
+                                 "content": f"{result}\n\nUI:\n{ui_tree}"}]
+                })
+                continue
+
+            # fallback
+            print(f"   ⚠️ 未知工具: {tool_use.name}")
             messages.append({
                 "role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": f"{result}\n\n当前屏幕 UI 元素:\n{ui_tree}"}]
+                "content": [{"type": "tool_result", "tool_use_id": tool_use.id, "content": "未知工具"}]
             })
 
         elapsed = time.time() - start_time
-        print(f"\n⚠️ 达到最大步骤数 {MAX_STEPS}，任务未完成")
-        print(f"⏱️ 耗时: {elapsed:.1f} 秒")
+        print(f"\n⚠️ 达到最大步数，耗时: {elapsed:.1f}秒")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("用法: python agent.py \"你的任务指令\"")
         sys.exit(1)
-
-    task = sys.argv[1]
-    agent = PhoneAgent()
-    agent.run(task)
+    PhoneAgent().run(sys.argv[1])
