@@ -81,6 +81,7 @@ APP_MAP = {
     "微信": "com.tencent.mm", "高德地图": "com.autonavi.minimap",
     "百度地图": "com.baidu.BaiduMap", "淘宝": "com.taobao.taobao",
     "支付宝": "com.eg.android.AlipayGphone", "大众点评": "com.dianping.v1",
+    "美团": "com.sankuai.meituan", "微信": "com.tencent.mm",
     "chrome": "com.android.chrome",
     "设置": "com.android.settings",
 }
