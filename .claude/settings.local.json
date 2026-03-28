@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(adb devices:*)",
+      "mcp__mobile-mcp__mobile_list_available_devices",
+      "mcp__mobile-mcp__mobile_take_screenshot",
+      "mcp__mobile-mcp__mobile_list_apps",
+      "mcp__mobile-mcp__mobile_launch_app",
+      "mcp__mobile-mcp__mobile_click_on_screen_at_coordinates",
+      "mcp__mobile-mcp__mobile_press_button",
+      "mcp__mobile-mcp__mobile_list_elements_on_screen",
+      "mcp__mobile-mcp__mobile_terminate_app",
+      "mcp__mobile-mcp__mobile_type_keys",
+      "Bash(python3 -m json.tool)",
+      "Read(//Users/user/**)",
+      "Bash(find /Users/user/Documents/work/phone-agent -maxdepth 2 -name *.json -not -path */.venv/* -not -path */node_modules/*)",
+      "Bash(xargs cat:*)",
+      "Bash(python3:*)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(pip list:*)",
+      "Bash(.venv/bin/python3 -c \"from openai import OpenAI; print\\(''''ok''''\\)\")",
+      "Bash(.venv/bin/python3 agent_mcp.py \"打开高德地图，搜索深圳市民中心，获取地址，然后查看驾车和公交到达时间\" 2>&1)",
+      "Bash(PHONE_AGENT_API_KEY=\"sk-c7d61e22958146b7b4612cb7b9bc441b\" .venv/bin/python3 agent_mcp.py \"打开高德地图，搜索深圳市民中心，获取地址，然后查看驾车和公交到达时间\" 2>&1)",
+      "Bash(npm info:*)",
+      "Bash(adb shell:*)",
+      "Bash(.venv/bin/python3 agent_mcp.py \"打开高德地图搜索华强北，获取地址和驾车公交到达时间\" 2>&1)",
+      "Bash(.venv/bin/python3 agent.py \"打开高德地图搜索华强北，获取地址和驾车公交到达时间\")",
+      "Bash(PHONE_AGENT_API_KEY=\"sk-c7d61e22958146b7b4612cb7b9bc441b\" .venv/bin/python3 agent.py \"打开高德地图搜索华强北，获取地址和驾车公交到达时间\")",
+      "Bash(.venv/bin/python3 agent_mcp.py \"打开高德地图搜索华强北，获取地址和驾车公交到达时间\")",
+      "Bash(while read:*)",
+      "Bash(do adb:*)",
+      "Bash(done)"
+    ]
+  }
+}
